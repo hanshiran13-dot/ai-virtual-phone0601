@@ -1,14 +1,11 @@
-// 小手机聊天插件 · 「TA 动我的手机」
-// 安装：聊天设置 →「扩展插件」→ 粘贴本文件全文 → 安装
-// 卸载/禁用即时生效，无需刷新页面，无需重新部署。
+// 小手机聊天插件 · 「TA 动我的手机」 v1.0.1
+// 安装：聊天设置 →「扩展插件」→ 导入 .js 文件
 //
-// 能力边界（务必先看）：
-//   插件接口只能「读」会话与联系人，不能改备注、不能置顶、不能拉黑；
-//   朋友圈没有开放接口。所以本插件只实现三个动作：
-//     1) 在你的对话里替你打字
-//     2) 以你的名义给别人发消息
-//     3) 以你的名义替某个人回怼
-//   其余动作需要改应用本体源码，插件做不到。
+// v1.0.1 修复：同意后消息没发出去
+//   - 写入消息改为「写入 + 回读校验 + 失败重试一次」
+//   - 执行时机从生成过程中挪到生成结束后 600ms，避开当轮消息重排
+//   - 失败时用 toast 显示具体原因，不再静默
+//   - 设置区每个会话加了「测试」按钮：点一下直接往这个会话塞一条消息，用来单独验证写入
 
 const LS_LOGS = "access_logs";
 const LS_LOCKS = "locked_sessions";
@@ -37,7 +34,7 @@ export default {
     id: "phone-access-consent",
     name: "TA 动我的手机",
     apiVersion: 1,
-    version: "1.0.0",
+    version: "1.0.1",
     author: "小坊",
     description: "让角色有限度地操作你的小手机：替你在对话里打字、以你的名义发消息。每次动手前有几秒可以拦住，事后可一键撤回。",
     permissions: ["chat.read", "chat.write", "ui", "storage"],
@@ -47,7 +44,8 @@ export default {
       { key: "allowSend", label: "允许以我的名义给别人发消息", type: "boolean", default: false },
       { key: "allowReply", label: "允许以我的名义回怼别人", type: "boolean", default: false },
       { key: "countdown", label: "动手前的倒计时（秒）", type: "number", default: 8, description: "倒计时内你可以点「拦住」；不理它就自动执行。3~30 秒。" },
-      { key: "promptFragment", label: "把「可操作手机」写进提示词", type: "boolean", default: true, description: "关掉后角色不会主动使用这个能力，但插件仍然可用（比如你自己在设置区手动触发）。" },
+      { key: "promptFragment", label: "把「可操作手机」写进提示词", type: "boolean", default: true, description: "关掉后角色不会主动使用这个能力。" },
+      { key: "verbose", label: "显示执行结果提示", type: "boolean", default: true, description: "每次动手后弹一条小提示，告诉你成没成、失败原因是什么。排查问题时就靠它。" },
     ],
   },
 
@@ -70,6 +68,9 @@ export default {
     const writeLocks = (v) => st.set(LS_LOCKS, v);
 
     const masterOn = () => S.get("master") === true;
+    const verbose = () => S.get("verbose") !== false;
+    const say = (text) => { if (verbose()) ctx.ui.toast(text); };
+
     const countdownSeconds = () => {
       const n = Number(S.get("countdown"));
       if (!isFinite(n) || n <= 0) return 8;
@@ -120,6 +121,40 @@ export default {
       const exact = list.find((s) => sessionName(s) === name);
       if (exact) return exact;
       return list.find((s) => sessionName(s).indexOf(name) >= 0 || name.indexOf(sessionName(s)) >= 0) || null;
+    };
+
+    /* ---------------- 写入消息（带回读校验与重试） ---------------- */
+
+    const pushUserMessage = (sessionId, content) => {
+      if (!sessionId) return { ok: false, id: "", error: "没有会话 ID" };
+      let lastError = "";
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const msg = ctx.data.messages.push({
+            sessionId,
+            role: "user",
+            content,
+            status: "sent",
+            createdAt: new Date().toISOString(),
+          });
+          if (!msg || !msg.id) {
+            lastError = "写入没有返回消息";
+            continue;
+          }
+          let found = false;
+          try {
+            found = (ctx.data.messages.list(sessionId) || []).some((x) => x.id === msg.id);
+          } catch (e) {
+            found = true; // 回读失败不算写入失败，按成功处理
+          }
+          if (found) return { ok: true, id: msg.id };
+          lastError = "写入后回读不到这条消息";
+        } catch (e) {
+          lastError = e && e.message ? e.message : String(e);
+        }
+      }
+      ctx.system.log("写入消息失败：" + lastError);
+      return { ok: false, id: "", error: lastError };
     };
 
     /* ---------------- 提示词片段 ---------------- */
@@ -177,8 +212,7 @@ export default {
     /* ---------------- 拦截浮层 ---------------- */
 
     const askConsent = (info) => new Promise((resolve) => {
-      const total = countdownSeconds();
-      let left = total;
+      let left = countdownSeconds();
       let settled = false;
       let ticker = null;
       let modalApi = null;
@@ -254,8 +288,7 @@ export default {
 
           const handle = ctx.system.timers.setInterval(() => {
             if (settled) return;
-            // 用户点遮罩关掉了浮层：按「拦住」处理，绝不默默执行
-            if (cardEl && !cardEl.isConnected()) { finish("block"); return; }
+            if (cardEl && !cardEl.isConnected) { finish("block"); return; }
             left -= 1;
             if (left <= 0) {
               cd.textContent = "正在执行…";
@@ -272,17 +305,10 @@ export default {
       }
     });
 
-    /* ---------------- 执行与撤销 ---------------- */
+    /* ---------------- 记录与撤销 ---------------- */
 
-    const pushAsUser = (sessionId, content) => ctx.data.messages.push({
-      sessionId,
-      role: "user",
-      content,
-      status: "sent",
-      createdAt: new Date().toISOString(),
-    });
-
-    const recordLog = (found, session, who) => {
+    const recordAndSend = (found, session, who) => {
+      const result = pushUserMessage(session.id, found.content);
       const entry = {
         id: "al_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
         kind: found.kind,
@@ -290,21 +316,16 @@ export default {
         target: sessionName(session),
         sessionId: session.id,
         content: found.content,
-        messageId: "",
+        messageId: result.id || "",
         createdAt: new Date().toISOString(),
         reverted: false,
+        failed: !result.ok,
+        error: result.error || "",
       };
-      try {
-        const msg = pushAsUser(session.id, found.content);
-        if (msg && msg.id) entry.messageId = msg.id;
-      } catch (e) {
-        ctx.system.log("写入消息失败", e);
-        return null;
-      }
       const logs = readLogs();
       logs.unshift(entry);
       writeLogs(logs);
-      return entry;
+      return { entry, result };
     };
 
     const revertLog = (entry) => {
@@ -353,18 +374,13 @@ export default {
       const currentSession = p.sessionId ? (allSessions().find((s) => s.id === p.sessionId) || null) : null;
 
       let session = null;
-      if (kind === "type") {
-        session = currentSession;
-      } else {
-        session = findSessionByName(targetName);
-      }
+      if (kind === "type") session = currentSession;
+      else session = findSessionByName(targetName);
 
       if (!session) {
         ctx.ui.toast("TA 想发消息，但没匹配到联系人，已跳过");
         return p;
       }
-
-      // 上锁的会话：直接拒绝，不进拦截流程
       if (readLocks().indexOf(session.id) >= 0) {
         ctx.ui.toast("目标会话已上锁，动作被拒绝");
         return p;
@@ -381,14 +397,26 @@ export default {
         return p;
       }
 
-      const entry = recordLog({ kind, content }, session, who);
-      if (entry) {
-        const done = kind === "type"
-          ? "已替你在对话里打了字"
-          : "已以你的名义发给「" + entry.target + "」";
-        ctx.ui.toast(who + " " + done);
-      }
-      refreshFragment();
+      // 延后执行：等这一轮生成把消息都落库、列表重排完，再插进来的消息才不会被吞掉
+      const targetSession = session;
+      ctx.system.timers.setTimeout(() => {
+        try {
+          const outcome = recordAndSend({ kind, content }, targetSession, who);
+          if (outcome.result.ok) {
+            const done = kind === "type"
+              ? "已替你在对话里打了字"
+              : "已以你的名义发给「" + outcome.entry.target + "」";
+            say(who + " " + done);
+          } else {
+            ctx.ui.toast("没发出去：" + (outcome.result.error || "未知原因"));
+          }
+          refreshFragment();
+        } catch (e) {
+          ctx.system.log("执行动作失败", e);
+          ctx.ui.toast("执行失败：" + (e && e.message ? e.message : String(e)));
+        }
+      }, 600);
+
       return p;
     };
 
@@ -396,20 +424,18 @@ export default {
 
     /* ---------------- 设置区：可见范围 + 撤销 ---------------- */
 
-    const styleEl = document.createElement("style");
-    styleEl.textContent = [
+    const styleDisposable = ctx.ui.injectCSS([
       ".pac-wrap{font:13px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;color:#1d1d1f;}",
       ".pac-title{font-size:14px;font-weight:600;margin:0 0 4px;}",
       ".pac-desc{font-size:12px;color:#86868b;margin:0 0 10px;}",
       ".pac-list{border:1px solid #e5e5e7;border-radius:10px;overflow:hidden;margin-bottom:18px;}",
       ".pac-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border-top:1px solid #f0f0f2;}",
       ".pac-row:first-child{border-top:none;}",
-      ".pac-row input{width:18px;height:18px;flex:0 0 auto;}",
+      ".pac-row input[type=checkbox]{width:18px;height:18px;flex:0 0 auto;}",
       ".pac-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
       ".pac-sub{font-size:12px;color:#86868b;}",
-      ".pac-btn{min-height:32px;padding:0 12px;border:none;border-radius:8px;background:#007aff;color:#fff;font-size:13px;font-weight:600;}",
+      ".pac-btn{min-height:30px;padding:0 12px;border:none;border-radius:8px;background:#007aff;color:#fff;font-size:12px;font-weight:600;flex:0 0 auto;}",
       ".pac-btn.ghost{background:#eef0f3;color:#1d1d1f;}",
-      ".pac-btn:disabled{opacity:.45;}",
       ".pac-empty{padding:14px;text-align:center;color:#86868b;font-size:12px;}",
       ".pac-item{padding:10px 12px;border-top:1px solid #f0f0f2;}",
       ".pac-item:first-child{border-top:none;}",
@@ -419,21 +445,21 @@ export default {
       ".pac-item-body{font-size:12px;color:#3a3a3c;word-break:break-word;white-space:pre-wrap;}",
       ".pac-item-foot{display:flex;align-items:center;gap:8px;margin-top:6px;}",
       ".pac-reverted{font-size:12px;color:#86868b;}",
-    ].join("");
-    const styleDisposable = ctx.ui.injectCSS(styleEl.textContent);
+      ".pac-fail{font-size:12px;color:#ff3b30;}",
+    ].join(""));
 
     const buildPanel = (el) => {
       el.innerHTML = "";
       const wrap = document.createElement("div");
       wrap.className = "pac-wrap";
 
-      // 1) 谁可以看哪些会话
+      // 1) 谁能被看见
       const t1 = document.createElement("div");
       t1.className = "pac-title";
       t1.textContent = "谁能被看见（上锁的会话 TA 翻不到，也发不了消息）";
       const d1 = document.createElement("div");
       d1.className = "pac-desc";
-      d1.textContent = "勾上 = 允许 TA 看到并能发消息；取消勾选 = 上锁。注意：这只管本插件。记忆库、设置这些要另外去「设置 → 聊天工具箱」把「本地资料库」关掉。";
+      d1.textContent = "勾上 = 允许 TA 看到并能发消息；取消勾选 = 上锁。右边的「测试」按钮会直接往这个会话塞一条消息，用来验证能不能写进去。";
 
       const list1 = document.createElement("div");
       list1.className = "pac-list";
@@ -445,8 +471,9 @@ export default {
         list1.appendChild(empty);
       } else {
         sessions.forEach((s) => {
-          const row = document.createElement("label");
+          const row = document.createElement("div");
           row.className = "pac-row";
+
           const cb = document.createElement("input");
           cb.type = "checkbox";
           cb.checked = readLocks().indexOf(s.id) < 0;
@@ -462,6 +489,7 @@ export default {
             refreshFragment();
             ctx.ui.toast(cb.checked ? "已允许 TA 看到这个会话" : "已上锁");
           };
+
           const name = document.createElement("div");
           name.className = "pac-name";
           name.textContent = sessionName(s);
@@ -471,8 +499,19 @@ export default {
             sub.textContent = " · 群聊";
             name.appendChild(sub);
           }
+
+          const testBtn = document.createElement("button");
+          testBtn.className = "pac-btn ghost";
+          testBtn.textContent = "测试";
+          testBtn.onclick = () => {
+            const r = pushUserMessage(s.id, "[插件测试] 这条是「TA 动我的手机」直接写入的测试消息");
+            if (r.ok) ctx.ui.toast("写入成功，去聊天里看看有没有这条");
+            else ctx.ui.toast("写入失败：" + (r.error || "未知原因"));
+          };
+
           row.appendChild(cb);
           row.appendChild(name);
+          row.appendChild(testBtn);
           list1.appendChild(row);
         });
       }
@@ -518,7 +557,12 @@ export default {
 
           const foot = document.createElement("div");
           foot.className = "pac-item-foot";
-          if (entry.reverted) {
+          if (entry.failed) {
+            const fail = document.createElement("span");
+            fail.className = "pac-fail";
+            fail.textContent = "没发出去：" + (entry.error || "未知原因");
+            foot.appendChild(fail);
+          } else if (entry.reverted) {
             const flag = document.createElement("span");
             flag.className = "pac-reverted";
             flag.textContent = "已撤回";
@@ -570,7 +614,7 @@ export default {
     const offChange = S.onChange(() => refreshFragment());
     const offOpened = ctx.hooks.on("session.opened", () => refreshFragment());
 
-    ctx.system.log("「TA 动我的手机」已加载，总开关：" + (masterOn() ? "开" : "关"));
+    ctx.system.log("「TA 动我的手机」v1.0.1 已加载，总开关：" + (masterOn() ? "开" : "关"));
 
     return () => {
       try { offChange(); } catch (e) { /* ignore */ }
